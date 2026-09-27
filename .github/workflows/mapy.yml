@@ -1,0 +1,95 @@
+name: Mapy
+
+# Jednou měsíčně vyrobí mapy krajů ČR z dat OpenStreetMap (sestavení Protomaps, formát PMTiles)
+# a zveřejní je jako nové vydání (release). Appka Kam se ukrýt si je stahuje z
+#   https://github.com/slevovagalerie/kam-se-ukryt-mapy/releases/latest/download/{kod}.pmtiles
+# a seznam krajů s velikostmi z .../latest/download/index.json.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "41 3 3 * *" # 3. den v měsíci
+  push:
+    branches: [main]
+    paths: [.github/workflows/mapy.yml]
+
+permissions:
+  contents: write
+
+jobs:
+  mapy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Nástroje
+        run: |
+          curl -sSL https://github.com/protomaps/go-pmtiles/releases/download/v1.31.2/go-pmtiles_1.31.2_Linux_x86_64.tar.gz | tar xz pmtiles
+          npm i -g osmtogeojson@3.0.0-beta.5 >/dev/null
+
+      - name: Nejnovější sestavení Protomaps
+        run: |
+          for d in $(seq 0 14); do
+            D=$(date -u -d "-$d day" +%Y%m%d)
+            if curl -sfI "https://build.protomaps.com/$D.pmtiles" >/dev/null; then
+              echo "MAPA=https://build.protomaps.com/$D.pmtiles" >> "$GITHUB_ENV"
+              echo "DATUM=$(date -u -d "-$d day" +%Y-%m-%d)" >> "$GITHUB_ENV"; break
+            fi
+          done
+          test -n "$(grep MAPA "$GITHUB_ENV")"
+
+      - name: Hranice ČR a krajů (OpenStreetMap, Overpass)
+        run: |
+          Q='[out:json][timeout:600];area["ISO3166-1"="CZ"]["admin_level"="2"]->.cz;(rel(area.cz)["boundary"="administrative"]["name"~"kraj$|^Kraj Vysočina$|^Praha$|^Hlavní město Praha$"];rel["ISO3166-1"="CZ"]["admin_level"="2"];);out geom;'
+          for server in https://overpass.private.coffee/api/interpreter https://overpass-api.de/api/interpreter https://overpass.kumi.systems/api/interpreter; do
+            code=$(curl -sS -A "kam-se-ukryt/1.0 (github.com/slevovagalerie)" -o hranice.osm.json -w "%{http_code}" --max-time 900 --data-urlencode "data=$Q" "$server" || echo 000)
+            if [ "$code" = "200" ]; then echo "::notice::Hranice z $server"; break; fi
+            echo "::warning::$server vrátil $code: $(head -c 300 hranice.osm.json | tr '\n' ' ')"; sleep 20
+          done
+          [ "$code" = "200" ]
+          osmtogeojson hranice.osm.json > hranice.geojson
+          node -e '
+            const fs = require("fs");
+            const fc = JSON.parse(fs.readFileSync("hranice.geojson"));
+            // název v OSM → [kód souboru, název kraje v datech úkrytů]
+            const K = { "Praha": ["praha","Hlavní město Praha"], "Hlavní město Praha": ["praha","Hlavní město Praha"],
+              "Středočeský kraj": ["stredocesky","Středočeský"], "Jihočeský kraj": ["jihocesky","Jihočeský"], "Plzeňský kraj": ["plzensky","Plzeňský"],
+              "Karlovarský kraj": ["karlovarsky","Karlovarský"], "Ústecký kraj": ["ustecky","Ústecký"], "Liberecký kraj": ["liberecky","Liberecký"],
+              "Královéhradecký kraj": ["kralovehradecky","Královéhradecký"], "Pardubický kraj": ["pardubicky","Pardubický"], "Kraj Vysočina": ["vysocina","Vysočina"],
+              "Jihomoravský kraj": ["jihomoravsky","Jihomoravský"], "Olomoucký kraj": ["olomoucky","Olomoucký"], "Zlínský kraj": ["zlinsky","Zlínský"],
+              "Moravskoslezský kraj": ["moravskoslezsky","Moravskoslezský"] };
+            const poly = (f) => /Polygon/.test(f.geometry.type);
+            const seznam = [];
+            for (const f of fc.features.filter(poly)) {
+              const p = (f.properties && f.properties.tags) || f.properties || {};
+              if (p["ISO3166-1"] === "CZ") fs.writeFileSync("cr.geojson", JSON.stringify(f));
+              const k = K[p.name];
+              if (k && !seznam.some((x) => x.kod === k[0])) { fs.writeFileSync(k[0] + ".geojson", JSON.stringify(f)); seznam.push({ kod: k[0], nazev: k[1] }); }
+            }
+            seznam.sort((a, b) => a.nazev.localeCompare(b.nazev, "cs"));
+            fs.writeFileSync("seznam.json", JSON.stringify(seznam));
+            console.log("::notice::Nalezeno " + fc.features.filter(poly).map((f) => { const t = (f.properties && f.properties.tags) || f.properties || {}; return t.name + " (" + t.admin_level + ")"; }).join(", "));
+            if (seznam.length !== 14) process.exit(1);
+          '
+
+      - name: Výřezy krajů
+        run: |
+          mkdir -p out
+          for kod in $(node -e 'for (const k of require("./seznam.json")) console.log(k.kod)'); do
+            ./pmtiles extract "$MAPA" "out/$kod.pmtiles" --region="$kod.geojson" --maxzoom=15 --download-threads=8 2>&1 | tail -1
+          done
+          node -e '
+            const fs = require("fs");
+            const s = require("./seznam.json").map((k) => ({ ...k, bytes: fs.statSync(`out/${k.kod}.pmtiles`).size, datum: process.env.DATUM }));
+            fs.writeFileSync("out/index.json", JSON.stringify(s));
+            console.log("::notice::" + s.map((k) => `${k.kod} ${Math.round(k.bytes / 1e6)} MB`).join(" · "));
+          '
+
+      - name: Nové vydání
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="mapy-$DATUM-$GITHUB_RUN_NUMBER"
+          gh release create "$TAG" out/*.pmtiles out/index.json --repo "$GITHUB_REPOSITORY" --latest \
+            --title "Mapy krajů $DATUM" \
+            --notes "Mapy krajů ČR pro offline použití v appce Kam se ukrýt. Data © přispěvatelé OpenStreetMap (licence ODbL), zpracování Protomaps. Stav dat $DATUM."
+          # Starší vydání smažeme, ať repo nebobtná (necháme poslední dvě).
+          gh release list --repo "$GITHUB_REPOSITORY" --limit 100 --json tagName,createdAt --jq 'sort_by(.createdAt) | reverse | .[2:] | .[].tagName' |
+            while read t; do gh release delete "$t" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag; done
